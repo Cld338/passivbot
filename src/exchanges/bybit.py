@@ -8,6 +8,7 @@ import traceback
 import numpy as np
 import passivbot_rust as pbr
 from collections import defaultdict
+import time
 from pure_funcs import (
     multi_replace,
     floatify,
@@ -24,7 +25,11 @@ assert_correct_ccxt_version(ccxt=ccxt_async)
 
 class BybitBot(Passivbot):
     def __init__(self, config: dict):
+        # [수정 1] recv_window 값을 안전한 범위(20초)로 설정
+        self.recv_window = 20000  
         super().__init__(config)
+        self.last_time_sync = 0  # 마지막으로 시간을 맞춘 시각 저장용 변수
+        
 
     def create_ccxt_sessions(self):
         self.ccp = getattr(ccxt_pro, self.exchange)(
@@ -33,6 +38,10 @@ class BybitBot(Passivbot):
                 "secret": self.user_info["secret"],
                 "password": self.user_info["passphrase"],
                 "headers": {"referer": self.broker_code} if self.broker_code else {},
+                'options': {
+                    'adjustForTimeDifference': True,
+                    "recvWindow": self.recv_window
+                },
             }
         )
         self.cca = getattr(ccxt_async, self.exchange)(
@@ -41,8 +50,14 @@ class BybitBot(Passivbot):
                 "secret": self.user_info["secret"],
                 "password": self.user_info["passphrase"],
                 "headers": {"referer": self.broker_code} if self.broker_code else {},
+                'options': {
+                    'adjustForTimeDifference': True,  # exchange-specific option
+                    "recvWindow": self.recv_window
+                },
             }
         )
+
+        
 
     def set_market_specific_settings(self):
         super().set_market_specific_settings()
@@ -57,19 +72,56 @@ class BybitBot(Passivbot):
             self.price_steps[symbol] = elm["precision"]["price"]
             self.c_mults[symbol] = elm["contractSize"]
 
+    async def resync_exchange_time(self):
+        try:
+            logging.info("⏳ Re-syncing time difference with Bybit server...")
+            # ccxt_async와 ccxt_pro 양쪽 모두 시간 오차를 갱신
+            await self.cca.load_time_difference()
+            if hasattr(self, 'ccp'):
+                await self.ccp.load_time_difference()
+            self.last_time_sync = time.time()
+            logging.info("✅ Time re-synced successfully.")
+        except Exception as e:
+            logging.error(f"⚠️ Failed to resync time: {e}")
+
+    # [수정] watch_orders 메서드 (핵심 수정 부분)
+    # [수정] watch_orders 함수 시작 부분에 시간 보정 로직 추가
     async def watch_orders(self):
+        # 1. 봇 시작 시 최초 1회 시간 동기화 (강제)
+        try:
+            logging.info("⏳ Synchronizing time with Bybit server...")
+            await self.cca.load_time_difference() # 여기서 오차(1.9초)를 계산해냅니다.
+            logging.info(f"✅ Time synced. Offset: {self.cca.time_difference}ms")
+        except Exception as e:
+            logging.error(f"⚠️ Initial time sync failed: {e}")
+
         while True:
             try:
+                # 2. 주기적 시간 동기화 (1시간마다) - 이전 답변의 로직 유지
+                if hasattr(self, 'last_time_sync') and time.time() - self.last_time_sync > 3600:
+                    await self.resync_exchange_time()
+
                 if self.stop_websocket:
                     break
+                
                 res = await self.ccp.watch_orders()
+                
                 for i in range(len(res)):
                     res[i]["position_side"] = determine_pos_side_ccxt(res[i])
                     res[i]["qty"] = res[i]["amount"]
                 self.handle_order_update(res)
+
             except Exception as e:
-                print(f"exception watch_orders", e)
+                # [추가 3] 에러 발생 시 처리 로직 강화
+                error_msg = str(e).lower()
+                logging.error(f"exception watch_orders: {e}")
                 traceback.print_exc()
+
+                # recv_window 또는 timestamp 에러가 발생하면 즉시 시간 동기화 실행
+                if "recvwindow" in error_msg or "timestamp" in error_msg:
+                    logging.warning("⚠️ Timestamp error detected! Force syncing time...")
+                    await self.resync_exchange_time()
+                
                 await asyncio.sleep(1)
 
     async def fetch_open_orders(self, symbol: str = None) -> [dict]:
@@ -109,7 +161,7 @@ class BybitBot(Passivbot):
         limit = 200
         try:
             fetched_positions, fetched_balance = await asyncio.gather(
-                self.cca.fetch_positions(params={"limit": limit}), self.cca.fetch_balance()
+                self.cca.fetch_positions(params={"limit": limit, "recv_window": self.recv_window}), self.cca.fetch_balance(params={"recv_window": self.recv_window})
             )
             balinfo = fetched_balance["info"]["result"]["list"][0]
             if balinfo["accountType"] == "UNIFIED":
@@ -143,7 +195,8 @@ class BybitBot(Passivbot):
                     break
                 # fetch more
                 fetched_positions = await self.cca.fetch_positions(
-                    params={"cursor": next_page_cursor, "limit": limit}
+                    params={"cursor": next_page_cursor, "limit": limit, "recvWindow": self.recv_window
+                }
                 )
             return sorted(positions.values(), key=lambda x: x["timestamp"]), balance
         except Exception as e:
@@ -270,35 +323,57 @@ class BybitBot(Passivbot):
             return []
 
     async def fetch_fills(self, start_time, end_time, limit=None):
-        if start_time is None:
-            result = await self.cca.fetch_my_trades()
-            return sorted(result, key=lambda x: x["timestamp"])
-        if end_time is None:
-            end_time = int(self.get_exchange_time() + 1000 * 60 * 60 * 4)
-        all_fetched_fills = []
-        prev_hash = ""
-        for _ in range(100):
-            fills = await self.cca.fetch_my_trades(
-                limit=limit, params={"paginate": True, "endTime": int(end_time)}
-            )
-            if not fills:
-                break
-            fills.sort(key=lambda x: x["timestamp"])
-            all_fetched_fills += fills
-            if fills[0]["timestamp"] <= start_time:
-                break
-            new_hash = calc_hash([x["id"] for x in fills])
-            if new_hash == prev_hash:
-                break
-            prev_hash = new_hash
-            logging.info(
-                f"fetched fills from {fills[0]['datetime']} to {fills[-1]['datetime']} n fills: {len(fills)}"
-            )
-            end_time = fills[0]["timestamp"]
-            limit = 1000
-        else:
-            logging.error(f"more than 100 calls to ccxt fetch_my_trades")
-        return sorted(all_fetched_fills, key=lambda x: x["timestamp"])
+        # [수정] 재시도 횟수 설정
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                if start_time is None:
+                    result = await self.cca.fetch_my_trades()
+                    return sorted(result, key=lambda x: x["timestamp"])
+                
+                if end_time is None:
+                    end_time = int(self.get_exchange_time() + 1000 * 60 * 60 * 4)
+                
+                all_fetched_fills = []
+                prev_hash = ""
+                
+                for _ in range(100):
+                    fills = await self.cca.fetch_my_trades(
+                        limit=limit, params={"paginate": True, "endTime": int(end_time)}
+                    )
+                    if not fills:
+                        break
+                    fills.sort(key=lambda x: x["timestamp"])
+                    all_fetched_fills += fills
+                    if fills[0]["timestamp"] <= start_time:
+                        break
+                    new_hash = calc_hash([x["id"] for x in fills])
+                    if new_hash == prev_hash:
+                        break
+                    prev_hash = new_hash
+                    logging.info(
+                        f"fetched fills from {fills[0]['datetime']} to {fills[-1]['datetime']} n fills: {len(fills)}"
+                    )
+                    end_time = fills[0]["timestamp"]
+                    limit = 1000
+                else:
+                    logging.error(f"more than 100 calls to ccxt fetch_my_trades")
+                
+                return sorted(all_fetched_fills, key=lambda x: x["timestamp"])
+
+            except Exception as e:
+                # [핵심 수정] InvalidNonce(시간 에러) 발생 시 처리
+                if "InvalidNonce" in str(e) or "timestamp" in str(e).lower():
+                    logging.warning(f"⚠️ Timestamp error in fetch_fills (Attempt {attempt+1}/{max_retries}). Resyncing time...")
+                    await self.resync_exchange_time() # 시간 다시 맞춤
+                    await asyncio.sleep(1) # 1초 대기 후 재시도
+                    continue # 루프의 처음으로 돌아가 재시도
+                else:
+                    # 다른 에러라면 그냥 에러 발생시키기
+                    raise e
+        
+        return []
 
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None):
         # fetch fills first, then pnls (bybit has them in separate endpoints)

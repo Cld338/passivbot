@@ -12,7 +12,9 @@ LOCK_FILE = os.path.join(RUST_SOURCE_DIR, ".compile.lock")
 LOCK_TIMEOUT = 300  # 5 minutes in seconds
 LOCK_CHECK_INTERVAL = 2  # Check every 2 seconds
 
-
+if sys.platform == 'win32':
+	asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
 def get_compiled_extension_paths():
     possible_extensions = ["so", "dylib", "dll", "pyd", "", "bundle", "sl"]
     return [
